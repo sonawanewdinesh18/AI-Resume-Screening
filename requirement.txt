@@ -1,8 +1,0 @@
-streamlit
-PyPDF2
-pandas
-scikit-learn
-matplotlib
-xlsxwriter
-docs
-
