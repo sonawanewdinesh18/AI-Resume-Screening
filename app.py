@@ -43,7 +43,7 @@ SKILL_TAXONOMY = [
     "aws", "amazon web services", "azure", "microsoft azure", "gcp", "google cloud platform",
     "docker", "kubernetes", "k8s", "terraform", "ansible", "jenkins", "gitlab ci", "github actions",
     "ci/cd", "continuous integration", "continuous deployment", "linux", "ubuntu", "nginx", "apache",
-    "serverless", "microservices", "kubernetes", "helm", "prometheus", "grafana",
+    "serverless", "microservices", "helm", "prometheus", "grafana",
     # Databases & Caching
     "sql", "mysql", "postgresql", "postgres", "sqlite", "oracle", "mongodb", "nosql", "redis",
     "cassandra", "elasticsearch", "dynamodb", "firebase", "supabase", "mariadb", "neo4j",
@@ -117,13 +117,10 @@ def extract_resume_text(uploaded_file) -> str:
 # NLP Preprocessing & Skill Extraction Engine
 # ---------------------------------------------------------
 def clean_text(text: str) -> str:
-    """
-    Cleans text while preserving essential technical characters like +, #, ., /
-    """
+    """Cleans text while preserving essential technical characters (+, #, ., /)."""
     if not text:
         return ""
     text = text.lower()
-    # Normalize tech symbols
     text = re.sub(r'c\+\+', 'cpp', text)
     text = re.sub(r'c\#', 'csharp', text)
     text = re.sub(r'\.net', 'dotnet', text)
@@ -132,21 +129,16 @@ def clean_text(text: str) -> str:
     text = re.sub(r'vue\.js', 'vuejs', text)
     text = re.sub(r'ci\/cd', 'cicd', text)
     
-    # Remove URLs, emails, phone numbers
     text = re.sub(r'https?://\S+|www\.\S+', ' ', text)
     text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', ' ', text)
     text = re.sub(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', ' ', text)
-    # Remove special punctuation but keep basic words and whitespace
     text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text)
-    # Remove multiple spaces
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 
 def extract_skills(text: str) -> set:
-    """
-    Extracts known skills and domain keywords from text using boundary matching.
-    """
+    """Extracts known skills and domain keywords from text using boundary matching."""
     if not text:
         return set()
     
@@ -162,57 +154,116 @@ def extract_skills(text: str) -> set:
 
 
 # ---------------------------------------------------------
-# Hybrid AI Ranking Model
+# Sentence-BERT Model Loader & Chunk Pooling
 # ---------------------------------------------------------
-def calculate_hybrid_scores(job_description: str, resume_data: list) -> list:
+@st.cache_resource(show_spinner=False)
+def load_sbert_model():
+    """Lazily loads and caches the Sentence-BERT all-MiniLM-L6-v2 model."""
+    try:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        return model, True
+    except Exception:
+        return None, False
+
+
+def chunk_text(text: str, max_words: int = 140) -> list:
+    """Chunks long text into overlapping paragraph blocks to avoid token limits."""
+    words = text.split()
+    if not words:
+        return [""]
+    if len(words) <= max_words:
+        return [text]
+    
+    step = max(40, int(max_words * 0.7))
+    chunks = []
+    for i in range(0, len(words), step):
+        chunks.append(" ".join(words[i:i + max_words]))
+    return chunks
+
+
+def compute_sbert_similarity(model, job_description: str, resume_texts: list) -> list:
+    """Computes semantic similarity with chunk pooling for multi-page resumes."""
+    from sentence_transformers import util
+    
+    jd_embedding = model.encode(job_description, convert_to_tensor=True, normalize_embeddings=True)
+    scores = []
+    
+    for text in resume_texts:
+        chunks = chunk_text(text, max_words=140)
+        chunk_embeddings = model.encode(chunks, convert_to_tensor=True, normalize_embeddings=True)
+        chunk_sims = util.cos_sim(jd_embedding, chunk_embeddings)[0].cpu().numpy()
+        
+        # Max chunk similarity + Top-3 average chunk similarity
+        top_k = min(3, len(chunk_sims))
+        sorted_sims = np.sort(chunk_sims)
+        top_k_avg = float(np.mean(sorted_sims[-top_k:]))
+        max_sim = float(sorted_sims[-1])
+        
+        combined_sim = max(0.0, (top_k_avg * 0.6) + (max_sim * 0.4))
+        scores.append(combined_sim)
+        
+    return scores
+
+
+# ---------------------------------------------------------
+# Dual-Engine AI Scoring Pipeline
+# ---------------------------------------------------------
+def calculate_scores(job_description: str, resume_data: list, use_sbert: bool = True) -> tuple:
     """
-    Computes an ensemble matching score combining:
-    1. Sublinear N-gram (1, 2) TF-IDF Cosine Similarity (55%)
-    2. Explicit Skill Coverage Ratio (35%)
-    3. Keyword Overlap & Density Factor (10%)
+    Computes ensemble matching score using Sentence-BERT (or TF-IDF fallback) + Skill Taxonomy.
     """
+    jd_skills = extract_skills(job_description)
     cleaned_jd = clean_text(job_description)
     cleaned_resumes = [clean_text(r["raw_text"]) for r in resume_data]
     
-    jd_skills = extract_skills(job_description)
+    sbert_model, sbert_ready = load_sbert_model() if use_sbert else (None, False)
     
-    # 1. Advanced TF-IDF Cosine Similarity
-    corpus = [cleaned_jd] + cleaned_resumes
-    vectorizer = TfidfVectorizer(
-        ngram_range=(1, 2),
-        stop_words="english",
-        sublinear_tf=True,
-        max_df=0.95,
-        min_df=1
-    )
-    tfidf_matrix = vectorizer.fit_transform(corpus)
-    cosine_sim_scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
-    
+    if use_sbert and sbert_ready:
+        semantic_scores = compute_sbert_similarity(sbert_model, job_description, [r["raw_text"] for r in resume_data])
+        engine_label = "🧠 Sentence-BERT (all-MiniLM-L6-v2)"
+        weight_semantic = 0.50
+        weight_skill = 0.40
+        weight_keyword = 0.10
+    else:
+        # High-performance N-Gram TF-IDF
+        corpus = [cleaned_jd] + cleaned_resumes
+        vectorizer = TfidfVectorizer(
+            ngram_range=(1, 2),
+            stop_words="english",
+            sublinear_tf=True,
+            max_df=0.95,
+            min_df=1
+        )
+        tfidf_matrix = vectorizer.fit_transform(corpus)
+        semantic_scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
+        engine_label = "⚡ Fast Hybrid TF-IDF"
+        weight_semantic = 0.55
+        weight_skill = 0.35
+        weight_keyword = 0.10
+        
     results = []
     for idx, r in enumerate(resume_data):
         raw_text = r["raw_text"]
         resume_skills = extract_skills(raw_text)
         
-        # Skill Metrics
+        # Skill Match Metrics
         matched_skills = sorted(list(jd_skills.intersection(resume_skills)))
         missing_skills = sorted(list(jd_skills.difference(resume_skills)))
         
         if len(jd_skills) > 0:
             skill_score = len(matched_skills) / len(jd_skills)
         else:
-            skill_score = cosine_sim_scores[idx]
-        
-        # Keyword Overlap Factor
+            skill_score = float(semantic_scores[idx])
+            
         jd_words = set(cleaned_jd.split())
         resume_words = set(cleaned_resumes[idx].split())
         keyword_overlap = len(jd_words.intersection(resume_words)) / max(len(jd_words), 1)
         
-        # Hybrid Weighted Ensemble Score (Scaled to 0 - 100%)
-        tfidf_score = max(0.0, float(cosine_sim_scores[idx]))
-        composite_score = (tfidf_score * 0.55) + (skill_score * 0.35) + (keyword_overlap * 0.10)
+        sim_val = max(0.0, float(semantic_scores[idx]))
+        composite_score = (sim_val * weight_semantic) + (skill_score * weight_skill) + (keyword_overlap * weight_keyword)
         final_percentage = round(min(composite_score * 100.0, 100.0), 2)
         
-        # Category Assessment
         if final_percentage >= 75:
             match_category = "🟢 Strong Match"
         elif final_percentage >= 50:
@@ -223,19 +274,19 @@ def calculate_hybrid_scores(job_description: str, resume_data: list) -> list:
         results.append({
             "name": r["name"],
             "score": final_percentage,
-            "tfidf_score": round(tfidf_score * 100, 2),
+            "semantic_score": round(sim_val * 100, 2),
             "skill_score": round(skill_score * 100, 2),
             "matched_skills": matched_skills,
             "missing_skills": missing_skills,
             "total_skills_found": len(resume_skills),
             "word_count": len(raw_text.split()),
             "category": match_category,
+            "engine_used": engine_label,
             "raw_text": raw_text
         })
         
-    # Sort descending by composite score
     results.sort(key=lambda x: x["score"], reverse=True)
-    return results, jd_skills
+    return results, jd_skills, engine_label
 
 
 # ---------------------------------------------------------
@@ -266,10 +317,10 @@ st.markdown(
     }}
     
     .glass-card {{
-        background: rgba(15, 23, 42, 0.75);
-        border: 1px solid rgba(56, 189, 248, 0.2);
+        background: rgba(15, 23, 42, 0.80);
+        border: 1px solid rgba(56, 189, 248, 0.25);
         border-radius: 16px;
-        padding: 24px;
+        padding: 22px;
         backdrop-filter: blur(12px);
         -webkit-backdrop-filter: blur(12px);
         box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
@@ -278,7 +329,7 @@ st.markdown(
     }}
     
     .glass-card:hover {{
-        border-color: rgba(56, 189, 248, 0.5);
+        border-color: rgba(56, 189, 248, 0.55);
         transform: translateY(-2px);
     }}
     
@@ -361,14 +412,25 @@ with col_logo2:
             unsafe_allow_html=True
         )
     st.markdown('<div class="hero-title">AI-Powered Resume Screener</div>', unsafe_allow_html=True)
-    st.markdown('<div class="hero-subtitle">Intelligent candidate screening using Hybrid TF-IDF & Skill Extraction NLP</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero-subtitle">Intelligent candidate screening using Hybrid SBERT & Skill Extraction NLP</div>', unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# Sidebar: Job Presets & Settings
+# Sidebar: Engine Selection, Presets & Settings
 # ---------------------------------------------------------
 with st.sidebar:
     st.image("logo.png" if os.path.exists("logo.png") else "image.png" if os.path.exists("image.png") else None, width=120)
-    st.markdown("### ⚙️ Quick Presets & Settings")
+    
+    st.markdown("### 🧠 AI Engine Selection")
+    model_choice = st.radio(
+        "Choose Screening AI Model:",
+        options=["Sentence-BERT (Recommended)", "Fast Hybrid TF-IDF"],
+        index=0,
+        help="Sentence-BERT provides deep contextual semantics. Fast Hybrid TF-IDF is lightweight and instantaneous."
+    )
+    use_sbert = (model_choice == "Sentence-BERT (Recommended)")
+    
+    st.markdown("---")
+    st.markdown("### ⚙️ Quick Presets")
     
     SAMPLE_JDS = {
         "Custom (Enter Your Own)": "",
@@ -391,13 +453,21 @@ with st.sidebar:
     selected_preset = st.selectbox("Choose a Job Description Preset:", list(SAMPLE_JDS.keys()))
     
     st.markdown("---")
-    st.markdown("### 📊 Model Scoring Breakdown")
-    st.info(
-        "**Hybrid NLP Architecture:**\n\n"
-        "• **TF-IDF N-Grams (55%)**: Contextual & semantic vocabulary alignment.\n"
-        "• **Skill Coverage (35%)**: Direct matching of extracted technical competencies.\n"
-        "• **Keyword Overlap (10%)**: Broad terminology & requirement density."
-    )
+    st.markdown("### 📊 Model Scoring Architecture")
+    if use_sbert:
+        st.info(
+            "**🧠 SBERT Hybrid Architecture:**\n\n"
+            "• **Sentence-BERT (50%)**: Deep semantic context & synonym understanding.\n"
+            "• **Skill Coverage (40%)**: Hard requirement verification.\n"
+            "• **Keyword Overlap (10%)**: Domain requirement density."
+        )
+    else:
+        st.info(
+            "**⚡ Fast TF-IDF Architecture:**\n\n"
+            "• **TF-IDF N-Grams (55%)**: Vocabulary & phrase matching.\n"
+            "• **Skill Coverage (35%)**: Hard requirement verification.\n"
+            "• **Keyword Overlap (10%)**: Broad terminology density."
+        )
     
     st.markdown("---")
     st.markdown("🌐 **[Live Streamlit App](https://ai-resume-screening-sfdhusg7bdptmf7mwazwgz18.streamlit.app/)**")
@@ -459,7 +529,8 @@ if process_button:
     elif not uploaded_files:
         st.error("⚠️ Please upload at least one resume (PDF, DOCX, or TXT)!")
     else:
-        with st.spinner("🧠 Analyzing resumes using Hybrid NLP & Skill Extraction..."):
+        engine_name = "Sentence-BERT" if use_sbert else "Fast TF-IDF"
+        with st.spinner(f"🧠 Screening resumes using {engine_name} & Skill Extraction..."):
             resume_data = []
             for file in uploaded_files:
                 text = extract_resume_text(file)
@@ -468,11 +539,11 @@ if process_button:
                     "raw_text": text
                 })
             
-            results, jd_skills = calculate_hybrid_scores(job_description, resume_data)
+            results, jd_skills, active_engine = calculate_scores(job_description, resume_data, use_sbert=use_sbert)
             
-            # Store in session state for persistence
             st.session_state["results"] = results
             st.session_state["jd_skills"] = list(jd_skills)
+            st.session_state["active_engine"] = active_engine
 
 # ---------------------------------------------------------
 # Display Results & Visualizations
@@ -480,9 +551,10 @@ if process_button:
 if "results" in st.session_state and st.session_state["results"]:
     results = st.session_state["results"]
     jd_skills = set(st.session_state.get("jd_skills", []))
+    active_engine = st.session_state.get("active_engine", "AI Model")
     
     st.markdown("---")
-    st.markdown("## 📊 Screening Results & Candidate Rankings")
+    st.markdown(f"## 📊 Screening Results & Candidate Rankings <span style='font-size:1rem; color:#38bdf8; font-weight:normal;'>({active_engine})</span>", unsafe_allow_html=True)
     
     # Overview Top Metrics
     top_candidate = results[0]
@@ -514,7 +586,7 @@ if "results" in st.session_state and st.session_state["results"]:
                     <h1 style="margin: 5px 0; color:#ffffff; font-size:2.2rem;">{cand['score']}%</h1>
                     <p style="margin:0 0 10px 0;">{cand['category']}</p>
                     <p style="color:#94a3b8; font-size:0.9rem; margin-bottom:5px;">
-                        <b>TF-IDF Match:</b> {cand['tfidf_score']}% | <b>Skill Match:</b> {cand['skill_score']}%
+                        <b>Semantic Match:</b> {cand['semantic_score']}% | <b>Skill Match:</b> {cand['skill_score']}%
                     </p>
                     <p style="color:#cbd5e1; font-size:0.85rem;">
                         <b>Matched Skills ({len(cand['matched_skills'])}):</b><br>
@@ -563,9 +635,10 @@ if "results" in st.session_state and st.session_state["results"]:
             c1, c2 = st.columns([1, 2])
             with c1:
                 st.markdown(f"**Overall Score:** `{r['score']}%`")
-                st.markdown(f"**TF-IDF Similarity:** `{r['tfidf_score']}%`")
+                st.markdown(f"**Semantic Similarity:** `{r['semantic_score']}%`")
                 st.markdown(f"**Skill Overlap:** `{r['skill_score']}%`")
                 st.markdown(f"**Word Count:** `{r['word_count']}` words")
+                st.markdown(f"**Model Engine:** `{r['engine_used']}`")
             with c2:
                 st.markdown("**✅ Matched Skills:**")
                 if r["matched_skills"]:
@@ -588,9 +661,10 @@ if "results" in st.session_state and st.session_state["results"]:
         "Rank": i + 1,
         "Resume Name": r["name"],
         "Final Match Score (%)": r["score"],
-        "TF-IDF Score (%)": r["tfidf_score"],
+        "Semantic Score (%)": r["semantic_score"],
         "Skill Match Score (%)": r["skill_score"],
         "Category": r["category"],
+        "Engine Used": r["engine_used"],
         "Matched Skills": ", ".join(r["matched_skills"]),
         "Missing Skills": ", ".join(r["missing_skills"]),
         "Word Count": r["word_count"]
